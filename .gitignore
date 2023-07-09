@@ -6,3 +6,5 @@ build
 *~
 slurm*
 logs
+*.e5*
+*.o5*
