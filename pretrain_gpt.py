@@ -2,12 +2,21 @@
 
 """Pretrain GPT"""
 
-import torch
 from functools import partial
+import logging
+import os
+from pathlib import Path
+import socket
+
+import torch
+import wandb
+
+from dist import get_world_size, setup_torch
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
+from megatron.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
@@ -15,13 +24,82 @@ from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
-from megatron.arguments import core_transformer_config_from_args
+
+log = logging.getLogger(__name__)
+
+WBRUN = None
+# if get_rank() == 0:
+
+PORT = os.environ.get('MASTER_PORT', '5432')
+RANK, WORLD_SIZE = setup_torch('DDP', port=PORT)
+HERE = Path(os.path.abspath(__file__)).parent
+
+ENV_FILTERS = [
+    'PS1',
+    'LSCOLORS',
+    'LS_COLORS',
+]
+
+ENV_PREFIXES = [
+    '_ModuleTable',
+    'BASH_FUNC_',
+]
+
+if RANK == 0:
+    tensorboard_dir = os.environ.get('TENSORBOARD_DIR', None)
+    if tensorboard_dir is not None:
+        log.info(f'Patching tensorboard from {tensorboard_dir}')
+        wandb.tensorboard.patch(root_logdir=tensorboard_dir)
+    # os.environ['WANDB_RUN_GROUP'] = f'experiment-{generate_id()}'
+    WBRUN = wandb.init(
+        project='Megatron-LM-Nvidia',
+        sync_tensorboard=True,
+        dir=tensorboard_dir,
+        resume='allow',
+        # dir=os.getcwd(),
+        # sync_tensorboard=True,
+        # group=f'experiment-{generate_id()}'
+    )
+    assert WBRUN is not None and WBRUN is wandb.run
+    wandb.run.log_code(HERE.as_posix())  # type:ignore
+    # WBRUN.config.update(args)
+    # WBRUN.log_code(HERE.as_posix())
+    model_size = os.environ.get('MODEL_SIZE', None)
+    if model_size is not None:
+        WBRUN.config.update({'MODEL_SIZE': model_size})
+    if WBRUN is not None:
+        assert WBRUN is wandb.run
+        WBRUN.config.update({'world_size': get_world_size()})
+        # env = dict(os.environ)
+        # _ = env.pop('LS_COLORS', None)
+        # WBRUN.config.update({'env': env})
+        env = dict(os.environ)
+        for key in ENV_FILTERS + ['LS_COLORS', 'LSCOLORS']:
+            _ = env.pop(key, None)
+        WBRUN.config.update({'env': env})
+        hostname = socket.gethostbyaddr(socket.gethostname())[0]
+        if hostname.startswith('theta'):
+            WBRUN.config.update({'machine': 'ThetaGPU'})
+        elif hostname.startswith('x3'):
+            WBRUN.config.update({'machine': 'Polaris'})
+        elif hostname.startswith('x1'):
+            WBRUN.config.update({'machine': 'Sunspot'})
+        else:
+            WBRUN.config.update({'machine': hostname})
+
+# RANK, WORLD_SIZE = setup_torch(
+#     backend='DDP',
+#     port='5432',
+# )
+# log.info(f'Hello from {RANK} / {WORLD_SIZE}')
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(get_args())
+    if wandb.run is not None:
+        wandb.run.config.update(config)
     model = GPTModel(
         config,
         num_tokentypes=0,
