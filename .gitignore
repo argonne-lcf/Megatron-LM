@@ -8,3 +8,15 @@ slurm*
 logs
 *.e5*
 *.o5*
+ALCF/hostfile
+affinity.sh
+cache/*
+dataset/*
+ds_config-gpt.json
+jobinfo
+jobstate
+logfiles
+outputs/*
+tensorboard/*
+venvs/*
+wandb/*
