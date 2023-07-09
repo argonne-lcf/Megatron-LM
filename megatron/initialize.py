@@ -171,10 +171,16 @@ def _initialize_distributed():
                 args.local_rank = device
             torch.cuda.set_device(device)
     # Call the init process
-    torch.distributed.init_process_group(
-        backend=args.distributed_backend,
-        world_size=args.world_size, rank=args.rank,
-        timeout=timedelta(minutes=args.distributed_timeout_minutes))
+    if not torch.distributed.is_initialized():
+        # torch.distributed.init_process_group(
+        #     backend=args.distributed_backend,
+        #     world_size=args.world_size, rank=args.rank,
+        #     timeout=timedelta(minutes=args.distributed_timeout_minutes))
+        from dist import setup_torch
+        PORT = os.environ.get('MASTER_PORT', '5432')
+        RANK, WORLD_SIZE = setup_torch('deepspeed', port=PORT)
+    else:
+        print(f'Already initialized at rank {torch.distributed.get_rank()}')
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
