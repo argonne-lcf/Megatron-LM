@@ -9,6 +9,7 @@ import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+import wandb
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
@@ -33,7 +34,7 @@ from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.utils import check_adlr_autoresume_termination
+from megatron.utils import check_adlr_autoresume_termination, throughput_calculator
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
@@ -42,6 +43,7 @@ from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 
+import dist as dist
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -499,7 +501,7 @@ def train_step(forward_step_func, data_iterator,
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, num_zeros_in_grad, model):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -575,6 +577,24 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
        (iteration % args.tensorboard_log_interval == 0):
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
+        if dist.get_rank() == 0:
+            # args.consumed_train_samples)
+            tdata = {
+                'iteration': iteration,
+                # 'consumed_train_samples': args.consumed_train_samples,
+                # 'consumed_train_tokens': args.consumed_train_tokens,
+                'learning_rate': learning_rate,
+                'batch_size': batch_size,
+                'loss_scale': loss_scale,
+                'grad_norm': grad_norm,
+            }
+            for key in loss_dict:
+                tdata[f'lm-loss/{key}'] = loss_dict[key]
+
+            tdata = {f'train/{k}': v for k, v in tdata.items()}
+            if wandb.run is not None:
+                wandb.run.log(tdata, commit=False)
+
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if args.log_learning_rate_to_tensorboard:
             writer.add_scalar('learning-rate', learning_rate, iteration)
@@ -664,6 +684,22 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
+        samples_per_sec, tflops, approx_params_in_billions = throughput_calculator(
+            model, args, elapsed_time, total_iterations
+        )
+        # Compute throughput.
+        samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
+        tokens_per_sec = samples_per_sec * args.seq_length
+        tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
+        if wandb.run is not None:
+            tput = {
+                'throughput/iteration-time': elapsed_time_per_iteration,  # 1000 ms / s
+                'throughput/samples_per_sec': samples_per_sec,
+                'throughput/tflops': tflops,
+                'throughput/approx_params_in_billions': approx_params_in_billions,
+            }
+            wandb.run.log(tput)
+
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
@@ -717,7 +753,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
-
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
@@ -741,7 +776,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+                                          grad_norm, params_norm, num_zeros_in_grad, model=model)
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -802,6 +837,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStop()
+
 
     return iteration
 
